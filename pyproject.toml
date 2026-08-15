@@ -1,0 +1,19 @@
+[project]
+name = "comfyui-hillobar"
+description = "Custom nodes for ComfyUI. Includes progressive-resolution (staged) sampling for MiniMax H3."
+version = "0.1.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+# Nothing beyond what ComfyUI itself installs (torch, comfy, tqdm).
+dependencies = []
+
+[project.urls]
+# Required by the Comfy Registry — must point at the published repository.
+Repository = "https://github.com/Hillobar/ComfyUI-Hillobar"
+
+[tool.comfy]
+# Registry publisher id, bare — the site displays it as "@hillobar".
+PublisherId = "hillobar"
+DisplayName = "ComfyUI-Hillobar"
+Icon = ""
