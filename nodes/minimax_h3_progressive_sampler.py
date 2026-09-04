@@ -368,10 +368,285 @@ class MiniMaxH3ProgressiveSampler:
         return x0
 
 
+# --------------------------------------------------------------------------
+# staged sampler guided
+# --------------------------------------------------------------------------
+
+def _kf_lists(guider):
+    for cond in _iter_conds(guider):
+        kfs = cond.get("minimax_keyframes")
+        if kfs:
+            yield kfs
+        payload = cond.get("model_conds", {}).get("minimax_payload")
+        if payload is not None and isinstance(payload.cond, dict) and payload.cond.get("keyframes"):
+            yield payload.cond["keyframes"]
+
+
+def has_keyframes(guider):
+    for _ in _kf_lists(guider):
+        return True
+    return False
+
+
+def check_keyframe_grid(guider, h, w, label):
+    for kfs in _kf_lists(guider):
+        for kf in kfs:
+            z = kf.get("latent")
+            if z is None:
+                continue
+            if int(z.shape[-2]) != h or int(z.shape[-1]) != w:
+                raise ValueError(
+                    "%s carries a keyframe latent on a %dx%d grid but its stages run on %dx%d. "
+                    "MiniMaxH3AddGuide takes its canvas from the latent you feed it, so build that "
+                    "conditioning against an AV latent of %d x %d pixels (width x height). "
+                    "Halving the target canvas is not enough unless it is a multiple of 64."
+                    % (label, int(z.shape[-2]), int(z.shape[-1]), h, w, w * 16, h * 16))
+
+
+def lowres_scale(stages):
+    scales = sorted({s for s, _ in stages if s < 1.0})
+    if len(scales) > 1:
+        raise ValueError(
+            "a single guider_lowres covers a single sub-1.0 scale, but the schedule has %d (%s); "
+            "use a two-stage schedule such as '0.5:0.55, 1.0:1.0'"
+            % (len(scales), ", ".join("%g" % s for s in scales)))
+    return scales[0] if scales else None
+
+
+def check_supported_guided(model, guider, guider_lowres):
+    if guider_lowres is None:
+        check_supported(model, guider)
+        return
+    if not isinstance(model, comfy.model_base.MiniMaxH3):
+        raise ValueError(
+            "MiniMax H3 progressive sampling only supports MiniMax H3 models, got %s"
+            % type(model).__name__)
+    if guider_lowres.model_patcher.model is not model:
+        raise ValueError(
+            "guider_lowres must be built on the same MODEL as guider, otherwise the weights are "
+            "loaded twice and the pinned memory estimate no longer holds")
+    if has_keyframes(guider) and not has_keyframes(guider_lowres):
+        raise ValueError(
+            "guider carries keyframes but guider_lowres does not; the low-resolution stages would "
+            "drop the anchor. Chain the same MiniMaxH3AddGuide nodes onto the low-resolution "
+            "conditioning, feeding them an AV latent at the stage canvas")
+
+
+class MiniMaxH3ProgressiveSamplerGuided(MiniMaxH3ProgressiveSampler):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "guider": ("GUIDER",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "latent_image": ("LATENT",),
+                "noise_seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "control_after_generate": True,
+                }),
+                "schedule": ("STRING", {"default": DEFAULT_SCHEDULE, "tooltip": SCHEDULE_TOOLTIP}),
+                "upscale_method": (UPSCALE_METHODS, {"default": "bicubic"}),
+                "verbose": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Log per-stage grid size, token count and elapsed seconds.",
+                }),
+            },
+            "optional": {
+                "guider_lowres": ("GUIDER", {
+                    "tooltip": "Same model and prompt, but with the guide images re-encoded at the "
+                               "low-resolution stage canvas. Required for fl2va keyframes; without "
+                               "it this node behaves exactly like the plain staged sampler.",
+                }),
+            },
+        }
+
+    CATEGORY = "Hillobar"
+    DESCRIPTION = (
+        "Progressive-resolution sampling for MiniMax H3, with an optional second guider carrying "
+        "the same keyframe guides re-encoded at the low-resolution stage canvas. That lifts the "
+        "fl2va restriction: keyframe cond rows are counted against the stage grid, so the guide "
+        "latent has to live on that grid too."
+    )
+
+    def sample(self, guider, sampler, sigmas, latent_image, noise_seed,
+               schedule, upscale_method, verbose, guider_lowres=None):
+        stages = parse_schedule(schedule)
+        model = guider.model_patcher.model
+        check_supported_guided(model, guider, guider_lowres)
+
+        latent = latent_image.copy()
+        samples = comfy.sample.fix_empty_latent_channels(
+            guider.model_patcher, latent["samples"],
+            latent.get("downscale_ratio_spacial", None),
+            latent.get("downscale_ratio_temporal", None))
+
+        if latent.get("noise_mask") is not None:
+            raise ValueError(
+                "a noise mask is packed against the input latent shape and cannot follow a "
+                "resolution change; remove it or use a single-stage '1.0:1.0' schedule")
+        if not getattr(samples, "is_nested", False):
+            raise ValueError(
+                "expected a MiniMax H3 AV latent (nested video+audio pair) from "
+                "EmptyMiniMaxH3LatentAV or MiniMaxH3ReferenceToVideo")
+
+        video, audio = samples.unbind()[0], samples.unbind()[1]
+        base_h, base_w = int(video.shape[-2]), int(video.shape[-1])
+        plan = split_sigmas(sigmas, stages)
+
+        low = lowres_scale(stages)
+        if guider_lowres is not None:
+            if low is None:
+                raise ValueError(
+                    "the schedule has no stage below 1.0, so guider_lowres would never be used; "
+                    "disconnect it or use a staged schedule")
+            low_h, low_w = stage_dims(base_h, base_w, low)
+            check_keyframe_grid(guider, base_h, base_w, "guider")
+            check_keyframe_grid(guider_lowres, low_h, low_w, "guider_lowres")
+            if verbose:
+                logging.info(
+                    "MiniMaxH3ProgressiveSamplerGuided: low stage grid %dx%d (canvas %dx%d px), "
+                    "final grid %dx%d (canvas %dx%d px)",
+                    low_h, low_w, low_w * 16, low_h * 16,
+                    base_h, base_w, base_w * 16, base_h * 16)
+
+        cur_v = resize_video(video, *stage_dims(base_h, base_w, plan[0][0]), method=upscale_method)
+        cur_a = audio
+
+        full_packed = packed_shape(video.shape, audio.shape)
+        orig_options = guider.model_options
+        guider.model_options = pin_memory_estimate(orig_options, full_packed)
+        orig_options_low = None
+        if guider_lowres is not None and guider_lowres is not guider:
+            orig_options_low = guider_lowres.model_options
+            guider_lowres.model_options = pin_memory_estimate(orig_options_low, full_packed)
+        try:
+            out_samples, last_x0 = self._run_stages_guided(
+                guider, guider_lowres, sampler, plan, latent, cur_v, cur_a, video, audio,
+                base_h, base_w, noise_seed, upscale_method, verbose, model)
+        finally:
+            guider.model_options = orig_options
+            if orig_options_low is not None:
+                guider_lowres.model_options = orig_options_low
+
+        out = latent.copy()
+        out.pop("downscale_ratio_spacial", None)
+        out.pop("downscale_ratio_temporal", None)
+        out["samples"] = out_samples.to(comfy.model_management.intermediate_device())
+
+        if last_x0 is not None:
+            denoised = out.copy()
+            denoised["samples"] = model.process_latent_out(last_x0.cpu())
+        else:
+            denoised = out
+        return (out, denoised)
+
+    def _run_stages_guided(self, guider, guider_lowres, sampler, plan, latent, cur_v, cur_a,
+                           video, audio, base_h, base_w, noise_seed, upscale_method, verbose, model):
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        out_samples = None
+        last_x0 = None
+
+        for idx, (scale, stage_sigmas) in enumerate(plan):
+            active = guider if (scale >= 1.0 or guider_lowres is None) else guider_lowres
+
+            nested = comfy.nested_tensor.NestedTensor((cur_v, cur_a))
+            stage_latent = dict(latent)
+            stage_latent["samples"] = nested
+
+            noise = Noise_RandomNoise(noise_seed + idx).generate_noise(stage_latent)
+            x0_capture = {}
+            callback = latent_preview.prepare_callback(
+                active.model_patcher, stage_sigmas.shape[-1] - 1, x0_capture)
+
+            started = time.perf_counter()
+            out_samples = active.sample(
+                noise, nested, sampler, stage_sigmas, denoise_mask=None,
+                callback=callback, disable_pbar=disable_pbar, seed=noise_seed)
+            elapsed = time.perf_counter() - started
+
+            if verbose:
+                logging.info(
+                    "MiniMaxH3ProgressiveSamplerGuided: stage %d/%d scale=%.3g grid=%dx%d "
+                    "video_tokens=%d steps=%d guider=%s elapsed=%.1fs",
+                    idx + 1, len(plan), scale, cur_v.shape[-2], cur_v.shape[-1],
+                    video_tokens(cur_v.shape), stage_sigmas.shape[-1] - 1,
+                    "main" if active is guider else "lowres", elapsed)
+
+            last_x0 = self._nested_x0(x0_capture, nested)
+            if idx == len(plan) - 1:
+                break
+            if last_x0 is None:
+                raise RuntimeError(
+                    "the sampler produced no x0 estimate, so the stage boundary cannot change "
+                    "resolution; use a sampler that reports 'denoised' in its callback")
+
+            x0 = model.process_latent_out(last_x0)
+            v0, a0 = x0.unbind()[0], x0.unbind()[1]
+            next_h, next_w = stage_dims(base_h, base_w, plan[idx + 1][0])
+            cur_v = resize_video(v0, next_h, next_w, upscale_method).to(video.dtype)
+            cur_a = a0.to(audio.dtype)
+
+        return out_samples, last_x0
+
+
+class MiniMaxH3StageLatent:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "schedule": ("STRING", {"default": DEFAULT_SCHEDULE, "tooltip": SCHEDULE_TOOLTIP}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "INT", "INT")
+    RETURN_NAMES = ("latent", "width", "height")
+    FUNCTION = "build"
+    CATEGORY = "Hillobar"
+    DESCRIPTION = (
+        "Empty AV latent on the low-resolution stage grid of a progressive schedule. Feed the "
+        "target-resolution latent in, wire the output into MiniMaxH3AddGuide so the guide images "
+        "are encoded at the canvas the low stages actually run on."
+    )
+
+    def build(self, latent, schedule):
+        stages = parse_schedule(schedule)
+        scale = lowres_scale(stages)
+        if scale is None:
+            raise ValueError(
+                "the schedule has no stage below 1.0, so there is no low-resolution canvas to build")
+
+        samples = latent["samples"]
+        if not getattr(samples, "is_nested", False) or len(samples.unbind()) != 2:
+            raise ValueError(
+                "expected a MiniMax H3 AV latent (nested video+audio pair) from "
+                "EmptyMiniMaxH3LatentAV or MiniMaxH3ImageToVideo")
+        video, audio = samples.unbind()[0], samples.unbind()[1]
+        if video.ndim != 5 or int(video.shape[1]) != 24:
+            raise ValueError("expected a MiniMax H3 video latent of shape [B, 24, T, H, W]")
+
+        h, w = stage_dims(int(video.shape[-2]), int(video.shape[-1]), scale)
+        device = comfy.model_management.intermediate_device()
+        stage_video = torch.zeros(
+            [video.shape[0], video.shape[1], video.shape[2], h, w],
+            dtype=video.dtype, device=device)
+        stage_audio = torch.zeros(audio.shape, dtype=audio.dtype, device=device)
+
+        out = latent.copy()
+        out.pop("noise_mask", None)
+        out["samples"] = comfy.nested_tensor.NestedTensor((stage_video, stage_audio))
+        return (out, w * 16, h * 16)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3ProgressiveSampler": MiniMaxH3ProgressiveSampler,
+    "MiniMaxH3StageLatent": MiniMaxH3StageLatent,
+    "MiniMaxH3ProgressiveSamplerGuided": MiniMaxH3ProgressiveSamplerGuided,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3ProgressiveSampler": "MiniMax H3 Progressive Sampler (staged)",
+    "MiniMaxH3StageLatent": "MiniMax H3 Stage Latent",
+    "MiniMaxH3ProgressiveSamplerGuided": "MiniMax H3 Progressive Sampler Guided (staged)",
 }
